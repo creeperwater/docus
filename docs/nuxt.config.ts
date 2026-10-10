@@ -29,6 +29,9 @@ export default defineNuxtConfig({
     }, {
       code: 'fr',
       name: 'Français',
+    }, {
+      code: 'zh-CN',
+      name: '简体中文',
     }],
   },
   llms: {
