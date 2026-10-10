@@ -1,0 +1,129 @@
+# Build the Docus documentation site and deploy it to GitHub Pages.
+#
+# Not the stock "Deploy Nuxt site to Pages" starter: this repo is a pnpm workspace
+# whose Nuxt app lives in docs/ and extends the local layer, and GitHub Pages is a
+# plain static host. Every deviation below is commented with what it fixes.
+name: Deploy Nuxt site to Pages
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      NUXT_GITHUB_TOKEN: ${{ secrets.NUXT_GITHUB_TOKEN }}
+      # Static export; the output is rewritten for Pages below (see "Adapt the export").
+      NITRO_PRESET: static
+      # Project pages are served under /<repo>/, so assets and links need the base path.
+      NUXT_APP_BASE_URL: /${{ github.event.repository.name }}/
+      # Origin only, on purpose: nuxt-agent-discovery@0.7.0 throws a hard build error
+      # when the site URL carries a path ("siteUrl must be an origin ... base path is
+      # not supported yet") and exposes no off switch. The cost is that canonical /
+      # hreflang / sitemap URLs omit the /<repo>/ prefix, and @nuxtjs/i18n logs a
+      # baseUrl mismatch per page. Deploy to a user site (<owner>.github.io) or a
+      # custom domain to get those right and drop this workaround.
+      NUXT_SITE_URL: https://${{ github.repository_owner }}.github.io
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # The repo has pnpm-lock.yaml + "packageManager": pnpm@12.9.1. The starter's
+      # npm/yarn detection is what made the run fail with "Dependencies lock file is
+      # not found" (setup-node was asked to cache npm) and would then fail on npm ci.
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare
+        run: pnpm run dev:prepare
+
+      # @nuxt/robots refuses to emit robots.txt under a base URL and says so loudly.
+      - name: Silence robots.txt under a base URL
+        run: echo "robots.robotsTxt=false" >> ~/.nuxtrc
+
+      # Same command the ci.yml "docs, generate" matrix case uses.
+      - name: Build the docs site
+        run: pnpm exec nuxt generate docs --extends ../layer
+
+      - name: Adapt the export for GitHub Pages
+        run: |
+          cat > /tmp/pages-fixup.mjs <<'EOF'
+          import fs from 'node:fs'
+          import path from 'node:path'
+
+          const out = process.argv[2]
+          const KEEP = new Set(['index.html', '200.html', '404.html'])
+
+          // 1. The layer prerenders routes as `foo/bar.html` (nitro.prerender
+          //    .autoSubfolderIndex: false). GitHub Pages has no extensionless URL
+          //    mapping, so move each route to `foo/bar/index.html`. Payloads already
+          //    live in that directory, so their URLs are unchanged.
+          let moved = 0
+          const walk = (dir) => {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const p = path.join(dir, entry.name)
+              if (entry.isDirectory()) walk(p)
+              else if (entry.name.endsWith('.html') && !KEEP.has(entry.name)) {
+                const target = p.slice(0, -'.html'.length)
+                fs.mkdirSync(target, { recursive: true })
+                fs.renameSync(p, path.join(target, 'index.html'))
+                moved++
+              }
+            }
+          }
+          walk(out)
+
+          // 2. Keep leading-underscore folders (_nuxt, _i18n, _payload.json, ...) intact.
+          fs.writeFileSync(path.join(out, '.nojekyll'), '')
+
+          // 3. The layer prerenders one landing page per locale and no `/`, so the
+          //    Pages root would 404. Redirect it to the default locale; relative so it
+          //    works under any base path.
+          fs.writeFileSync(
+            path.join(out, 'index.html'),
+            '<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=./en/"><link rel="canonical" href="./en/"><title>Docus</title></head><body>Redirecting to <a href="./en/">/en/</a>.</body></html>\n'
+          )
+          console.log(`moved ${moved} routes to directory indexes`)
+          EOF
+          node /tmp/pages-fixup.mjs "$PWD/docs/.output/public"
+          ls docs/.output/public | head -20
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./docs/.output/public
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
